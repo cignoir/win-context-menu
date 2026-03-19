@@ -1,6 +1,6 @@
 [package]
 name = "win-context-menu"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 authors = ["cignoir"]
@@ -32,6 +32,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
     "Win32_System_Memory",
+    "Win32_System_Ole",
 ]
 
 [dependencies.tracing]

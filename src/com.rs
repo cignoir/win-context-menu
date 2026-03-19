@@ -9,6 +9,7 @@ use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
     COINIT_DISABLE_OLE1DDE,
 };
+use windows::Win32::System::Ole::OleFlushClipboard;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 
 /// RAII guard for COM initialization. Calls `CoUninitialize` on drop.
@@ -58,6 +59,13 @@ impl ComGuard {
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
+        // SAFETY: `OleFlushClipboard` converts any OLE clipboard data object
+        // into a static snapshot so that clipboard content (e.g. file copy)
+        // survives after this process exits. Safe to call even when no OLE
+        // clipboard data is present — it simply returns S_OK.
+        unsafe {
+            let _ = OleFlushClipboard();
+        }
         // SAFETY: Balanced with the `CoInitializeEx` call in `new()`.
         // Must run on the same thread that called `CoInitializeEx`.
         unsafe {
