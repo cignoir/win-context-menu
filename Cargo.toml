@@ -1,6 +1,6 @@
 [package]
 name = "win-context-menu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 authors = ["cignoir"]
@@ -13,6 +13,11 @@ keywords = ["windows", "context-menu", "shell", "explorer", "com"]
 categories = ["os::windows-apis", "gui"]
 readme = "README.md"
 exclude = ["/.github/", "/target/"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
 
 [dependencies]
 thiserror = "2.0"
