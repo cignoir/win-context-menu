@@ -56,7 +56,7 @@ impl std::fmt::Display for MenuItem {
 }
 
 /// Boxed closure that executes a context menu command.
-type Invoker = Box<dyn FnOnce(Option<InvokeParams>) -> crate::error::Result<()>>;
+pub(crate) type Invoker = Box<dyn FnOnce(Option<InvokeParams>) -> crate::error::Result<()>>;
 
 /// A menu item that was selected by the user via
 /// [`ContextMenu::show`](crate::ContextMenu::show) or
@@ -64,10 +64,16 @@ type Invoker = Box<dyn FnOnce(Option<InvokeParams>) -> crate::error::Result<()>>
 ///
 /// Call [`execute`](SelectedItem::execute) to run the associated shell command,
 /// or inspect [`menu_item`](SelectedItem::menu_item) to decide first.
+///
+/// The `SelectedItem` keeps the hidden helper window alive until it is dropped
+/// or consumed by [`execute`](SelectedItem::execute), ensuring the owner HWND
+/// remains valid for commands that display UI (e.g., Properties dialog).
 pub struct SelectedItem {
     pub(crate) menu_item: MenuItem,
     pub(crate) command_id: u32,
     pub(crate) invoker: Option<Invoker>,
+    /// Prevent the hidden window from being destroyed before execute().
+    pub(crate) _hidden_window: Option<crate::hidden_window::HiddenWindow>,
 }
 
 impl SelectedItem {

@@ -6,6 +6,8 @@
 //! `TrackPopupMenu`, and finally invoke or inspect the result.
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::FORMATETC;
+use windows::Win32::System::Ole::OleGetClipboard;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL, GCS_VERBA, IContextMenu, IContextMenu2,
@@ -25,6 +27,11 @@ use crate::shell_item::ShellItems;
 const ID_FIRST: u32 = 1;
 /// Last command ID.
 const ID_LAST: u32 = 0x7FFF;
+/// Sentinel command ID for the injected "Paste" item on background menus.
+const ID_PASTE_INJECTED: u32 = 0x8000;
+
+/// CF_HDROP clipboard format ID (file drop format).
+const CF_HDROP: u16 = 15;
 
 /// Builder for displaying a Windows Explorer context menu.
 ///
@@ -87,7 +94,14 @@ impl ContextMenu {
     /// Returns `Ok(Some(item))` if the user selected an item, or `Ok(None)` if
     /// the menu was dismissed without a selection.
     pub fn show_at(self, x: i32, y: i32) -> Result<Option<SelectedItem>> {
-        let ctx_menu = self.get_context_menu()?;
+        let hidden_window = HiddenWindow::new()?;
+        let hwnd = if let Some(h) = self.owner_hwnd {
+            HWND(h as *mut _)
+        } else {
+            hidden_window.hwnd
+        };
+
+        let ctx_menu = self.get_context_menu_with_hwnd(hwnd)?;
 
         // SAFETY: `CreatePopupMenu` allocates a new empty HMENU. Cannot fail
         // in practice, but we propagate the error anyway.
@@ -103,18 +117,17 @@ impl ContextMenu {
                 .map_err(Error::QueryContextMenu)?;
         }
 
+        // For background menus, inject clipboard-related items (Paste) that
+        // CreateViewObject doesn't include by default.
+        if self.items.is_background {
+            inject_clipboard_items(hmenu);
+        }
+
         // Query for IContextMenu2/3 for owner-drawn submenu support.
         let ctx2: Option<IContextMenu2> = ctx_menu.cast().ok();
         let ctx3: Option<IContextMenu3> = ctx_menu.cast().ok();
 
-        let hidden_window = HiddenWindow::new()?;
         hidden_window.set_context_menu_handlers(ctx2, ctx3);
-
-        let hwnd = if let Some(h) = self.owner_hwnd {
-            HWND(h as *mut _)
-        } else {
-            hidden_window.hwnd
-        };
 
         // SAFETY: `SetForegroundWindow` with our window handle. Required so
         // the menu dismisses when the user clicks outside it.
@@ -139,16 +152,40 @@ impl ContextMenu {
 
         let selected = if cmd.as_bool() {
             let command_id = cmd.0 as u32;
-            let item = get_menu_item_info_for_id(&ctx_menu, hmenu, command_id)?;
-            let ctx_menu_clone = ctx_menu.clone();
-            let hwnd_val = hwnd;
-            Some(SelectedItem {
-                menu_item: item,
-                command_id,
-                invoker: Some(Box::new(move |params: Option<InvokeParams>| {
-                    invoke_command(&ctx_menu_clone, command_id - ID_FIRST, hwnd_val, params)
-                })),
-            })
+            if command_id == ID_PASTE_INJECTED {
+                // Injected "Paste" item — invoke via verb string
+                let ctx_menu_clone = ctx_menu.clone();
+                let hwnd_val = hwnd;
+                Some(SelectedItem {
+                    menu_item: MenuItem {
+                        id: ID_PASTE_INJECTED,
+                        label: "Paste".to_string(),
+                        command_string: Some("paste".to_string()),
+                        is_separator: false,
+                        is_disabled: false,
+                        is_checked: false,
+                        is_default: false,
+                        submenu: None,
+                    },
+                    command_id: ID_PASTE_INJECTED,
+                    invoker: Some(Box::new(move |_params: Option<InvokeParams>| {
+                        crate::invoke::invoke_command_by_verb(&ctx_menu_clone, "paste", hwnd_val)
+                    })),
+                    _hidden_window: Some(hidden_window),
+                })
+            } else {
+                let item = get_menu_item_info_for_id(&ctx_menu, hmenu, command_id)?;
+                let ctx_menu_clone = ctx_menu.clone();
+                let hwnd_val = hwnd;
+                Some(SelectedItem {
+                    menu_item: item,
+                    command_id,
+                    invoker: Some(Box::new(move |params: Option<InvokeParams>| {
+                        invoke_command(&ctx_menu_clone, command_id - ID_FIRST, hwnd_val, params)
+                    })),
+                    _hidden_window: Some(hidden_window),
+                })
+            }
         } else {
             None
         };
@@ -179,17 +216,24 @@ impl ContextMenu {
     /// Returns a flat list of [`MenuItem`] structs (submenus are nested inside
     /// the `submenu` field). Useful for building custom UIs or for testing.
     pub fn enumerate(&self) -> Result<Vec<MenuItem>> {
-        let ctx_menu = self.get_context_menu_ref()?;
+        let hidden_window = HiddenWindow::new()?;
+        let ctx_menu = self.get_context_menu_with_hwnd(hidden_window.hwnd)?;
 
         // SAFETY: `CreatePopupMenu` allocates a new empty HMENU.
         let hmenu = unsafe { CreatePopupMenu().map_err(Error::Windows)? };
 
         let flags = self.query_flags();
         // SAFETY: Same as in `show_at`.
+        // SAFETY: Same as in `show_at`.
         unsafe {
             ctx_menu
                 .QueryContextMenu(hmenu, 0, ID_FIRST, ID_LAST, flags)
                 .map_err(Error::QueryContextMenu)?;
+        }
+
+        // For background menus, inject clipboard-related items (Paste).
+        if self.items.is_background {
+            inject_clipboard_items(hmenu);
         }
 
         let items = enumerate_menu(&ctx_menu, hmenu)?;
@@ -202,29 +246,71 @@ impl ContextMenu {
         Ok(items)
     }
 
+    /// Invoke a shell verb directly without showing the menu.
+    ///
+    /// This is useful for programmatically executing commands like "copy", "cut",
+    /// or "paste" in response to keyboard shortcuts.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use win_context_menu::{init_com, ContextMenu, ShellItems};
+    ///
+    /// let _com = init_com()?;
+    /// let items = ShellItems::from_path(r"C:\some\file.txt")?;
+    /// ContextMenu::new(items)?.invoke_verb("copy")?;
+    /// # Ok::<(), win_context_menu::Error>(())
+    /// ```
+    pub fn invoke_verb(&self, verb: &str) -> Result<()> {
+        let hidden_window = HiddenWindow::new()?;
+        let hwnd = if let Some(h) = self.owner_hwnd {
+            HWND(h as *mut _)
+        } else {
+            hidden_window.hwnd
+        };
+
+        let ctx_menu = self.get_context_menu_with_hwnd(hwnd)?;
+
+        // QueryContextMenu is required before InvokeCommand — the shell handler
+        // needs it to initialise internal state even when we don't show a menu.
+        let hmenu = unsafe { CreatePopupMenu().map_err(Error::Windows)? };
+        let flags = self.query_flags();
+        unsafe {
+            ctx_menu
+                .QueryContextMenu(hmenu, 0, ID_FIRST, ID_LAST, flags)
+                .map_err(Error::QueryContextMenu)?;
+        }
+
+        let result = crate::invoke::invoke_command_by_verb(&ctx_menu, verb, hwnd);
+
+        unsafe {
+            let _ = DestroyMenu(hmenu);
+        }
+
+        result
+    }
+
     fn query_flags(&self) -> u32 {
-        let mut flags = CMF_NORMAL | CMF_EXPLORE;
+        let mut flags = CMF_NORMAL;
+        if !self.items.is_background {
+            flags |= CMF_EXPLORE;
+        }
         if self.extended {
             flags |= CMF_EXTENDEDVERBS;
         }
         flags
     }
 
-    fn get_context_menu(&self) -> Result<IContextMenu> {
-        self.get_context_menu_ref()
-    }
-
-    fn get_context_menu_ref(&self) -> Result<IContextMenu> {
+    fn get_context_menu_with_hwnd(&self, hwnd: HWND) -> Result<IContextMenu> {
         if self.items.is_background {
-            // Background context menu — ask the folder's IShellFolder for a
-            // view object implementing IContextMenu.
-            // SAFETY: `CreateViewObject` is a COM call on our valid
-            // IShellFolder. A default (null) HWND is acceptable here.
+            // Background context menu — ask the folder's IShellFolder for the
+            // background menu via CreateViewObject.
+            // SAFETY: `CreateViewObject` is a COM call on our valid IShellFolder.
             unsafe {
                 let menu: IContextMenu = self
                     .items
                     .parent
-                    .CreateViewObject(HWND::default())
+                    .CreateViewObject(hwnd)
                     .map_err(Error::GetContextMenu)?;
                 Ok(menu)
             }
@@ -241,7 +327,7 @@ impl ContextMenu {
                 let menu: IContextMenu = self
                     .items
                     .parent
-                    .GetUIObjectOf(HWND::default(), &pidl_ptrs, None)
+                    .GetUIObjectOf(hwnd, &pidl_ptrs, None)
                     .map_err(Error::GetContextMenu)?;
                 Ok(menu)
             }
@@ -392,4 +478,61 @@ fn get_menu_item_info_for_id(
         is_default: mii.fState.contains(MFS_DEFAULT),
         submenu: None,
     })
+}
+
+/// Check if the clipboard has file data and inject "Paste" at the top of the menu.
+fn inject_clipboard_items(hmenu: HMENU) {
+    let has_files = clipboard_has_files();
+
+    if has_files {
+        // Insert a separator + "Paste" at position 0 (top of menu)
+        let paste_label: Vec<u16> = "貼り付け(V)\0".encode_utf16().collect();
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STRING | MIIM_FTYPE,
+            fType: MFT_STRING,
+            wID: ID_PASTE_INJECTED,
+            dwTypeData: windows::core::PWSTR(paste_label.as_ptr() as *mut _),
+            cch: paste_label.len() as u32 - 1,
+            ..Default::default()
+        };
+        // SAFETY: `hmenu` is a valid menu handle. We insert at position 0.
+        unsafe {
+            let _ = InsertMenuItemW(hmenu, 0, true, &mii);
+        }
+
+        // Add separator after Paste
+        let sep = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE,
+            fType: MFT_SEPARATOR,
+            ..Default::default()
+        };
+        // SAFETY: Insert separator at position 1 (after Paste).
+        unsafe {
+            let _ = InsertMenuItemW(hmenu, 1, true, &sep);
+        }
+    }
+}
+
+/// Check if the system clipboard contains file data (CF_HDROP).
+fn clipboard_has_files() -> bool {
+    // SAFETY: `OleGetClipboard` retrieves the current OLE clipboard data object.
+    let data_obj = unsafe { OleGetClipboard() };
+    let data_obj = match data_obj {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    let fmt = FORMATETC {
+        cfFormat: CF_HDROP,
+        ptd: std::ptr::null_mut(),
+        dwAspect: 1, // DVASPECT_CONTENT
+        lindex: -1,
+        tymed: 1, // TYMED_HGLOBAL
+    };
+
+    // SAFETY: `QueryGetData` checks if the data object supports the given format.
+    let result = unsafe { data_obj.QueryGetData(&fmt) };
+    result.is_ok()
 }

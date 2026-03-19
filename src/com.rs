@@ -5,11 +5,8 @@
 //! wrappers so that COM lifetime and PIDL memory are automatically managed.
 
 use crate::error::{Error, Result};
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
-    COINIT_DISABLE_OLE1DDE,
-};
-use windows::Win32::System::Ole::OleFlushClipboard;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Ole::{OleFlushClipboard, OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 
 /// RAII guard for COM initialization. Calls `CoUninitialize` on drop.
@@ -41,15 +38,14 @@ impl ComGuard {
     /// Returns [`Error::ComInit`] if COM has already been initialized with an
     /// incompatible threading model on this thread.
     pub fn new() -> Result<Self> {
-        // SAFETY: `CoInitializeEx` is the documented way to enter the COM
-        // apartment. We pass `COINIT_APARTMENTTHREADED` for STA and
-        // `COINIT_DISABLE_OLE1DDE` to avoid legacy DDE issues. Calling this
-        // once per thread is safe; redundant calls return S_FALSE and are
-        // balanced by `CoUninitialize` in `Drop`.
+        // SAFETY: `OleInitialize` initializes COM in STA mode **and** the OLE
+        // clipboard / drag-drop subsystem. We need the OLE clipboard so that
+        // shell copy/paste (which uses `OleSetClipboard` internally) works
+        // correctly and `OleFlushClipboard` can persist data after process exit.
+        // Calling once per thread is safe; redundant calls return S_FALSE and
+        // are balanced by `OleUninitialize` in `Drop`.
         unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-                .ok()
-                .map_err(Error::ComInit)?;
+            OleInitialize(None).map_err(Error::ComInit)?;
         }
         Ok(Self {
             _not_send: std::marker::PhantomData,
@@ -66,10 +62,10 @@ impl Drop for ComGuard {
         unsafe {
             let _ = OleFlushClipboard();
         }
-        // SAFETY: Balanced with the `CoInitializeEx` call in `new()`.
-        // Must run on the same thread that called `CoInitializeEx`.
+        // SAFETY: Balanced with the `OleInitialize` call in `new()`.
+        // Must run on the same thread that called `OleInitialize`.
         unsafe {
-            CoUninitialize();
+            OleUninitialize();
         }
     }
 }

@@ -72,3 +72,33 @@ pub(crate) fn invoke_command(
 
     Ok(())
 }
+
+/// Invoke a context menu command by its verb string (e.g. "paste", "delete").
+pub(crate) fn invoke_command_by_verb(
+    ctx_menu: &windows::Win32::UI::Shell::IContextMenu,
+    verb: &str,
+    hwnd: HWND,
+) -> Result<()> {
+    let verb_ansi: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let info = CMINVOKECOMMANDINFOEX {
+        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+        fMask: CMIC_MASK_UNICODE,
+        hwnd,
+        lpVerb: PCSTR(verb_ansi.as_ptr()),
+        lpVerbW: windows::core::PCWSTR(verb_wide.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    // SAFETY: Same as invoke_command — `info` is fully initialized with valid
+    // verb string pointers (not MAKEINTRESOURCE).
+    unsafe {
+        ctx_menu
+            .InvokeCommand(std::ptr::addr_of!(info) as *const _)
+            .map_err(Error::InvokeCommand)?;
+    }
+
+    Ok(())
+}
